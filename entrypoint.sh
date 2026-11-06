@@ -49,8 +49,8 @@ CADDY_STARTUP_TIMEOUT="${CADDY_STARTUP_TIMEOUT:-60}"
 #              then never orders one per <app>.<domain> label (a managed wildcard
 #              covers them), at no network cost. Delegated, both names come from Let's
 #              Encrypt through the backend's acme-dns API (credential: PROVIDER_STR).
-#              caddy-docker-proxy re-reads it with the Caddyfile on every generation
-#              (its polling interval), so a change needs no restart.
+#              A change after start is loaded by reload_generated (below):
+#              caddy-docker-proxy alone would not see it.
 #   ZONE_STATE_DIR/passthrough, /automate  read by the catch-all tick below:
 #     automate     the root, which cert0 (*.<zone>) covers, so automatic HTTPS would
 #                  skip it (Caddy's `certificates.automate` makes it manage it anyway)
@@ -134,7 +134,8 @@ apply_zone() {
         rm -f "$tmp"
     else
         mv "$tmp" "$ZONE_FILE"
-        echo "[zone] ${DOMAIN:-?}: $([ "$live" = 1 ] && echo "delegated, DNS-01 issuer" || echo "not delegated, gateway CA + internal wildcard") (applied at the next generation)"
+        GENERATED_CHANGED=1
+        echo "[zone] ${DOMAIN:-?}: $([ "$live" = 1 ] && echo "delegated, DNS-01 issuer" || echo "not delegated, gateway CA + internal wildcard")"
     fi
     echo "$live" >"$ZONE_LAST_STATE"
     if [ "$live" = 1 ]; then
@@ -273,8 +274,8 @@ proxy_file_content() {
     printf 'servers :443 {\n\tlistener_wrappers {\n\t\tproxy_protocol {\n\t\t\ttimeout 5s\n\t\t\tallow %s\n\t\t\tfallback_policy ignore\n\t\t}\n\t\ttls\n\t}\n\ttrusted_proxies static %s\n\ttrusted_proxies_strict\n}\n' "$list" "$list"
 }
 
-# apply_proxy [timeout]: rewrite PROXY_FILE when the sources changed; applied by
-# caddy-docker-proxy at its next generation.
+# apply_proxy [timeout]: rewrite PROXY_FILE when the sources changed; loaded by
+# reload_generated after start.
 apply_proxy() {
     local sources tmp
     sources=$(proxy_sources "$@") || return 0
@@ -284,7 +285,8 @@ apply_proxy() {
         rm -f "$tmp"
     else
         mv "$tmp" "$PROXY_FILE"
-        echo "[proxy] PROXY protocol from: $(printf '%s' "$sources" | tr '\n' ' ')(applied at the next generation)"
+        GENERATED_CHANGED=1
+        echo "[proxy] PROXY protocol from: $(printf '%s' "$sources" | tr '\n' ' ')"
     fi
 }
 
@@ -366,6 +368,59 @@ apply_usage() {
     fi
 }
 
+# =============================================================================
+# Loading an imported file's change
+# =============================================================================
+# caddy-docker-proxy rebuilds the config only when the Caddyfile it generates changes
+# (v2.13.1 loader.go: bytes.Equal on the generated text). ZONE_FILE and PROXY_FILE are
+# imported by that text, which reads the same whatever they hold, so a change after
+# start waited for an unrelated label change: a prod box delegated on 2026-11-06 stayed
+# hours on the internal issuer and never ordered its certificates.
+#
+# reload_generated loads the last generated Caddyfile (caddy-docker-proxy's autosave)
+# again with the imports read now: the same adapt + load caddy-docker-proxy runs on a
+# label change. admin and logging are kept from the running config when the file sets
+# none (caddy-docker-proxy adds them to its own pushes). caddy-docker-proxy pushes
+# again only at its next own change, which reads the files afresh as well. The
+# catch-all routes the load drops come back at the catch-all watcher's next tick, as
+# after any generation. A failed adapt or load leaves the running config as it is
+# and is retried at the next tick.
+CADDYFILE_AUTOSAVE="${XDG_CONFIG_HOME:-/config}/caddy/Caddyfile.autosave"
+GENERATED_CHANGED=0
+
+reload_generated() {
+    local new body
+    if [ ! -s "$CADDYFILE_AUTOSAVE" ]; then
+        echo "[reload] No generated Caddyfile yet: caddy-docker-proxy's first generation reads the files"
+        return 0
+    fi
+    new=$(mktemp) && body=$(mktemp) || return 1
+    if ! caddy adapt --config "$CADDYFILE_AUTOSAVE" --adapter caddyfile >"$new" 2>"$new.err"; then
+        echo "[reload] WARN: the generated Caddyfile does not adapt, running config kept: $(tail -n 1 "$new.err")"
+        rm -f "$new" "$new.err" "$body"
+        return 1
+    fi
+    if ! curl -sf "http://${CADDY_ADMIN}/config/" 2>/dev/null \
+        | jq -c --slurpfile n "$new" '$n[0]
+            + (if $n[0].admin then {} else {admin: .admin} end)
+            + (if $n[0].logging then {} else {logging: .logging} end)
+            | with_entries(select(.value != null))' >"$body" 2>/dev/null \
+        || [ ! -s "$body" ]; then
+        echo "[reload] WARN: could not read the running config, retrying next tick"
+        rm -f "$new" "$new.err" "$body"
+        return 1
+    fi
+    if curl -sf -X POST -H "Content-Type: application/json" --data-binary "@$body" \
+        "http://${CADDY_ADMIN}/load" >/dev/null 2>"$new.err"; then
+        echo "[reload] Loaded the zone/PROXY change into the running config"
+        rm -f "$new" "$new.err" "$body"
+        return 0
+    fi
+    echo "[reload] WARN: Caddy refused the config, running config kept, retrying next tick"
+    rm -f "$new" "$new.err" "$body"
+    return 1
+}
+
 # A delegated box goes back to the internal wildcard only after ZONE_DOWNGRADE_CHECKS
 # readings in a row say "not delegated": one odd answer (backend restarting, a gap in
 # its cache) must not swap the box's certificates. Becoming delegated applies at once.
@@ -374,6 +429,8 @@ ZONE_DOWNGRADE_CHECKS="${ZONE_DOWNGRADE_CHECKS:-3}"
 start_zone_watcher() {
     set +e
     local live last misses=0
+    # what init_zone / apply_proxy wrote before Caddy started is read by the first generation
+    GENERATED_CHANGED=0
     echo "[zone] Watching the backend's view of ${DOMAIN:-?} every ${ZONE_CHECK_INTERVAL}s"
     [ "$(cat "$ZONE_LAST_STATE" 2>/dev/null)" = 1 ] && report_caa
     while true; do
@@ -393,6 +450,9 @@ start_zone_watcher() {
         apply_zone "${live:-0}"
         [ "$live" = 1 ] && report_caa
         apply_proxy 10
+        if [ "$GENERATED_CHANGED" = 1 ] && reload_generated; then
+            GENERATED_CHANGED=0
+        fi
         report_proxy
     done
 }
