@@ -46,6 +46,7 @@ services:
 | `PROVIDER_STR` | — | Box identity `<backend>,<userid>,<signature>`: asks the backend about the zone, and is the acme-dns credential |
 | `DOMAIN` | — | The box domain (`<user>.<zone>`) |
 | `ZONE_CHECK_INTERVAL` | `120` | Seconds between checks of the zone's delegation |
+| `MESH_ZONE_CERTS` | `box` | `gateway`: the box never orders its zone's certificates (apex + `*.<domain>`), delegated or not. The zone keeps the gateway CA root and the internal wildcard, no CAA is reported, and the gateway terminates every name with its per-user fallback certificate. For a box rebuilt every day (a demo). Anything else reads as `box` |
 | `ZONE_DOWNGRADE_CHECKS` | `3` | Consecutive "not delegated" answers before a delegated box goes back to the internal wildcard (becoming delegated applies at once) |
 | `TUNNEL_HOST` | `mesh-router-tunnel` | Name of the tunnel container, whose address joins the PROXY allow list |
 | `PROXY_REPORT_MINUTES` | `30` | Minutes between re-reports of the PROXY capability to the backend (it forgets one after 2 h) |
