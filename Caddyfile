@@ -56,13 +56,24 @@
 # ROOT DOMAIN ROUTING - Configurable default service
 # =============================================================================
 
+# The default service's signed-in marker into the access log as "maison_auth": Maison
+# answers X-Maison-Auth: 1 to a request its gate passed a user identity, and an
+# intrusion detector reading the log can keep that user's address from being banned.
+# The access log drops every response header (MESH_ACCESS_LOG), so this is the one that
+# reaches it. Empty when the default service sends no such header.
+(default_service_log) {
+    log_append maison_auth {http.response.header.X-Maison-Auth}
+}
+
 # Root domain via gateway (custom CA)
 {$DOMAIN} {
     import gateway_tls
+    import default_service_log
     reverse_proxy {$DEFAULT_SERVICE_HOST}:{$DEFAULT_SERVICE_PORT}
 }
 
 # Root domain via sslip.io (Let's Encrypt)
 {$PUBLIC_IP_DASH}.sslip.io {
+    import default_service_log
     reverse_proxy {$DEFAULT_SERVICE_HOST}:{$DEFAULT_SERVICE_PORT}
 }
